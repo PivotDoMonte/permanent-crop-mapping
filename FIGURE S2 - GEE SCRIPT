@@ -1,0 +1,312 @@
+/////////////////////////////////////////////////
+//                                             //
+//            FIGURE S2 - GEE SCRIPT           //
+//                                             //
+/////////////////////////////////////////////////
+
+/*
+Article
+Refining European Crop Mapping Classification through the Integration of Permanent Crops: 
+A Case Study in Rapidly Transitioning Irrigated Landscapes Induced by Dam Construc-tion
+
+Manuel Quintela, Manuel L. Campagnolo and Rui Figueira
+
+Info satelite: 
+
+S1 
+As EU Crop Map (VV, VH e VV/VH)
+
+S2 
+As DGT (NDVI, NDWI, NBR, NDBI e NDMIR). 
+Interpolation was performed to fill NaN values using the previous and following months, which is why the temporal window starts in December 2017 and ends in January 2019.
+
+Cloud mask applied using the 'Cloud Score+S2_HARMONIZED' approach.
+
+Standard deviation calculated based on the annual mean of each of the previously mentioned variables."
+
+"Import the cluster shapefile as a 'table'
+*/
+
+//=============================================
+// FILL DATA
+//=============================================
+
+//DATAS S1
+var Inicio = '2024-01-01';
+var Fim = '2024-12-31';
+
+//DATAS S2
+var InicioS2 = '2023-12-01';
+var FimS2 = '2025-01-31';
+
+//FICHEIRO DE SAÍDA
+
+var NOMEFINAL = 'Stack_1';
+
+//=============================================
+// PROCESSING STARTS
+//=============================================
+
+// Define ROI.
+var roi = table.geometry();
+
+Map.centerObject(roi,10);
+Map.addLayer(roi,{color: 'FF0000', fillOpacity: 0},'Área de interesse');
+
+// Date
+var startDate = ee.Date(Inicio);
+var endDate =  ee.Date(Fim);
+
+//=============================================
+// A - SENTINEL 2, level 2A
+//=============================================
+
+// Date
+var startDateS2 = ee.Date(InicioS2);
+var endDateS2 =  ee.Date(FimS2);
+
+// Call S2 collection
+var S2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+.filterDate(startDateS2, endDateS2)
+.filterBounds(roi);
+
+print('A1: Info do S2',S2);
+print('A1: Info do S2', typeof S2);
+
+// Cloud mask
+var csPlus = ee.ImageCollection('GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED');
+var S2SNtudo = S2.linkCollection(csPlus, ['cs'])
+             .map(function(img) {
+              return img.updateMask(img.select('cs').gte(0.6));
+              });
+
+var S2SN = S2SNtudo.select(['B2','B3','B4','B8','B8A','B11','B12']);
+print('A2: Coleção com mascara',S2SN);
+
+// Monthly composites calculation
+
+// For month
+var month = 1;
+
+// Calculating number of intervals
+var monthsS2 = endDateS2.difference(startDateS2,'month').divide(month).toInt();
+
+// Generating a sequence 
+var sequenceS2 = ee.List.sequence(0, monthsS2); 
+print('A3: sequencia para o composito',sequenceS2);
+
+// For S2 bands
+var Composito_S2 = sequenceS2.map(function(num){
+    num = ee.Number(num);
+    var Start_interval = startDateS2.advance(num.multiply(month), 'month');
+    var End_interval = startDateS2.advance(num.add(1).multiply(month), 'month');
+    var subset = S2SN.filterDate(Start_interval,End_interval);
+    return subset.median().set('system:time_start',Start_interval);
+});
+print('A4: (1)Compositos bandas S2',Composito_S2);
+
+var BandasS2 = ee.ImageCollection.fromImages(Composito_S2);
+print('A5: (2)Compositos bandas S2',BandasS2);
+
+// Index calculations
+var addIndices = function(image) {
+  var ndvi = image.normalizedDifference(['B8', 'B4']); // Calcula o NDVI
+  var ndwi = image.normalizedDifference(['B3', 'B8']); // Calcula o NDWI
+  var nbr = image.normalizedDifference(['B8A', 'B12']); // Calcula o NBR
+  var ndbi = image.normalizedDifference(['B11', 'B8A']); // Calcula o NDBI
+  var ndmir = image.normalizedDifference(['B11', 'B12']); // Calcula o NDMIR
+  return image.addBands(ndvi.rename('NDVI'))
+              .addBands(ndwi.rename('NDWI'))
+              .addBands(nbr.rename('NBR'))
+              .addBands(ndbi.rename('NDBI'))
+              .addBands(ndmir.rename('NDMIR')); 
+};
+
+var S2Tudo = BandasS2.map(addIndices);
+var S2Indices = S2Tudo.select(['NDVI','NDWI','NBR','NDBI','NDMIR']);
+print('A6: S2 sem interpolação',S2Indices);
+
+// Interpolation to fill NaN values
+function interpolateImageCollection(collection) {
+    var listOfImages = collection.toList(collection.size());
+    
+    var interpolatedList = ee.List.sequence(1, collection.size().subtract(2)).map(function(i) {
+        i = ee.Number(i);
+        var prevImage = ee.Image(listOfImages.get(i.subtract(1)));
+        var nextImage = ee.Image(listOfImages.get(i.add(1)));
+        var currentImage = ee.Image(listOfImages.get(i));
+        var interpolated = currentImage.unmask(prevImage.add(nextImage).divide(2));
+        return interpolated.set('system:time_start', currentImage.get('system:time_start'));
+    });
+    var firstImage = ee.Image(listOfImages.get(0));
+    var lastImage = ee.Image(listOfImages.get(collection.size().subtract(1)));
+    
+    interpolatedList = ee.List([firstImage]).cat(interpolatedList).cat([lastImage]);
+    
+    return ee.ImageCollection.fromImages(interpolatedList);
+}
+
+var S2Interpolated = interpolateImageCollection(S2Indices);
+print('A7: Final com intrepolação', S2Interpolated);
+
+// Remove December 2017 and January 2019
+var S2Filtered = S2Interpolated.filter(ee.Filter.date(Inicio, Fim));
+var S2Final = S2Filtered.toBands().clip(roi);//-------------------INFO DO S2 FIM
+print('A8: FINAL S2', S2Final);
+
+// See test image
+var rgbVis_1 = {
+  min: 0,
+  max: 2500,
+  bands: ['B4', 'B3', 'B2'],
+};
+var rgbVis_2 = {
+  min: 0,
+  max: 1,
+  bands: ['1_NDVI'],
+  palette: ['red', 'yellow', 'green'],
+};
+
+Map.addLayer(BandasS2, rgbVis_1, 'Compositos de bandas S2, RGB de janeiro');
+Map.addLayer(S2Final, rgbVis_2, 'Compositos de índices S2, NDVI de janeiro');
+
+//=============================================
+// B - Sentinel 1
+//=============================================
+
+// Functions---
+
+// Convert from/to dB.
+function toNatural(img) {
+  return ee.Image(10.0).pow(img.select('..').divide(10.0)).copyProperties(img, ['system:time_start']);
+}
+  
+function toDB(img) {
+  return ee.Image(img).log10().multiply(10.0).copyProperties(img, ['system:time_start']);
+}
+  
+// Remove ugly edges.
+function maskEdge(img) {
+  var mask = img.select(0).unitScale(-25, 5).multiply(255).toByte().connectedComponents(ee.Kernel.rectangle(1,1), 100);
+  return img.updateMask(mask.select(0).abs());  
+}
+
+// Calculate the VV/VH ratio.
+function S1VHVV (img) { var ratio = img.select(['VH']).divide(img.select(['VV'])).rename('VHVV');
+  return img.addBands(ratio,['VHVV']);
+}
+
+// End of Functions---
+
+// Call S1 collection
+var sentinel1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterMetadata('instrumentMode', 'equals', 'IW')
+  .filter(ee.Filter.eq('transmitterReceiverPolarisation', ['VV', 'VH']))
+  .filterDate(startDate, endDate)
+  .filterBounds(roi);
+
+print('B1: S1',sentinel1);
+
+// Remove ugly edges.
+var sentinel1_mask = sentinel1.map(maskEdge);
+  
+// Average are made from natural (non-logarithmic) values.
+var sentinel1_mask_nat = sentinel1_mask.map(toNatural);
+
+//Monthly composites calculation
+
+// Calculating number of intervals
+var monthsS1 = endDate.difference(startDate,'month').divide(month).toInt();
+
+// Generating a sequence 
+var sequenceS1 = ee.List.sequence(0, monthsS1); 
+
+// Based on the median value
+var s1res = sequenceS1.map(function(num){
+    num = ee.Number(num);
+    var Start_interval = startDate.advance(num.multiply(month), 'month');
+    var End_interval = startDate.advance(num.add(1).multiply(month), 'month');
+    var subset = sentinel1_mask_nat.filterDate(Start_interval, End_interval);
+    return subset.median().set('system:time_start',Start_interval);
+});
+
+// Transform back to dB.
+var sequence_s1_sing = s1res.map(toDB);
+
+print('B2: sequência VV e VH',sequence_s1_sing);
+
+//------
+
+// VHVV are computed separately as they should not be converted to dB.
+var sentinel1_ratio = sentinel1_mask_nat.map(S1VHVV);
+
+// This function reduces the collection to one multiband S1 image per month
+var sequence_s1_ratio = sequenceS1.map(function(num){
+    num = ee.Number(num);
+    var Start_interval = startDate.advance(num.multiply(month), 'month');
+    var End_interval = startDate.advance(num.add(1).multiply(month), 'month');
+    var subset = sentinel1_ratio.filterDate(Start_interval,End_interval);
+    return subset.median().set('system:time_start',Start_interval).select(['VHVV']);
+});
+
+print('B3: sequência VV/VH',sequence_s1_ratio);
+
+//------
+
+// Put the two lists together 
+var combine_db_ratio = sequence_s1_sing.zip(sequence_s1_ratio).flatten();
+
+var byMonthYearS1 = ee.ImageCollection.fromImages(combine_db_ratio);
+var S1Final = byMonthYearS1.toBands().clip(roi);//----------------------------INFO DO S1 FIM
+
+print('B4: FINAL DO S1',S1Final);
+Map.addLayer(S1Final, {min: -25, max: 5}, '0_VV');
+
+//=============================================
+// STANDARD DEVIATION
+//=============================================
+
+var S2Filtereds_median = S2Filtered.mean();
+print('C1: Mediana S2',S2Filtereds_median);
+
+var S1_VV_VH_image = ee.ImageCollection.fromImages(sequence_s1_sing);
+var S1_VV_VH_median = S1_VV_VH_image.mean();
+print('C2: Mediana S1 VV e VH',S1_VV_VH_median);
+
+var S1_VVVH_image = ee.ImageCollection.fromImages(sequence_s1_ratio);
+var S1_VVVH_median = S1_VVVH_image.mean();
+print('C3: Mediana S1 VV e VH',S1_VVVH_median);
+
+var STACK_MEDIANA = S2Filtereds_median.addBands(S1_VV_VH_median).addBands(S1_VVVH_median);
+print('C4: Mediana DE TUDO',STACK_MEDIANA);
+
+var STACK_DP = STACK_MEDIANA.reduceNeighborhood({
+  reducer: ee.Reducer.stdDev(),
+  kernel: ee.Kernel.circle(1),
+});
+
+print('C5: FINAL DO DESVIO PADRÃO',STACK_DP);
+
+//=============================================
+// PUTTING IT ALL TOGETHER
+//=============================================
+
+var STACK = S1Final.addBands(S2Final).addBands(STACK_DP).toFloat();
+print('STACK FINAL',STACK);
+
+//=============================================
+// Export Satck
+//=============================================
+
+Export.image.toDrive({
+  image: STACK, 
+  description: NOMEFINAL, 
+  folder: 'Dissertação Alqueva MQ',  
+  scale: 10,  
+  region: roi,   
+  maxPixels: 1e10,
+  fileFormat: 'GeoTIFF',  
+  formatOptions: {
+    cloudOptimized: true  
+  }
+});
